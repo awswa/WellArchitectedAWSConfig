@@ -1,80 +1,97 @@
-const { ConfigServiceClient, DescribeConformancePackComplianceCommand } = require("@aws-sdk/client-config-service");
-const { DynamoDBClient, QueryCommand } = require("@aws-sdk/client-dynamodb");
-const { UpdateAnswer } = require('./UpdateAnswer');
+const { WellArchitectedClient, UpdateAnswerCommand } = require("@aws-sdk/client-wellarchitected");
+const { DynamoDBClient, QueryCommand, PutItemCommand } = require("@aws-sdk/client-dynamodb");
 
-exports.handler= async function DescribeConformancePack(event){
-    const client = new ConfigServiceClient({ region: "us-east-1" });
+async function UpdateAnswer(answers){
+    const WAclient = new WellArchitectedClient({ region: "us-east-1" });
     const DBclient = new DynamoDBClient({ region: "us-east-1" });
+    console.log("Updating Answer...Please wait.");
+    //console.log("results: ", answers);
 
     try{
-        //collect all rules without next token
-        input = {
-            ConformancePackName: 'SecurityPillar',
-        }
-        //Get the first 50 rules in conformance pack
-        const command = new DescribeConformancePackComplianceCommand(input);
-        const response = await client.send(command);
-        let token = response.NextToken;
-        const ConfigRules = response.ConformancePackRuleComplianceList;
-        //If more than 50, get the rest of rules in conformance pack
-        while (token){
-            //console.log(token);
-
-            //collect all rules with next token
-            next_rules = {
-                    ConformancePackName: 'SecurityPillar',
-                    NextToken: token,
-                }
-            const Rules = new DescribeConformancePackComplianceCommand(next_rules);
-            const NewResponse = await client.send(Rules);
-
-            //Add newly found ConfigRuleName into all ConfigRuleName
-            ConfigRules.push.apply(ConfigRules, NewResponse.ConformancePackRuleComplianceList);
-
-            // retrieve the next set of ConfigRuleName if exists
-            token = NewResponse.NextToken;
-        }
-
-        //get WA question id and choice id that we need to update answer in WAFR
-        GetQuestionID(ConfigRules, DBclient);
-        return true;
-
-    }catch(err){
-        console.error(err);
-    }
-}
-
-async function GetQuestionID(ConfigRules, DBclient){
-    try{
+        //const id= 'SEC-3.7';
         let iteration = 0;
-        ConfigRules.forEach(async (ConfigRule) => {
-            //If it's compliant based on rules in AWS config, let's retrieve ControlID which is mapped to WA Question and Choice
-            if (ConfigRule.ComplianceType == 'COMPLIANT') {
-                const AWSConfigRule = ConfigRule.ConfigRuleName.substring(0, ConfigRule.ConfigRuleName.indexOf('-conformance'));
-                const params = {
-                    TableName: "WAConfigRules",
-                    //TableName : 'WAConfigRuleMapping',
-                    ExpressionAttributeValues: {
-                        ':AWSConfigRule': { S: AWSConfigRule}
-                    },
-                    KeyConditionExpression: 'AWSConfigRule = :AWSConfigRule',
-                    // Need only ControlID to answer the particular best practice in question
-                    ProjectionExpression: 'ControlID',
-                };
-                //console.log(params);
-                const command = new QueryCommand(params);
-                const result = await DBclient.send(command);
-                //console.log(result.Items);
-                const answer = await UpdateAnswer(result, iteration);
-                console.log("iteration in describe:", iteration);
+        IDs = answers;
+        IDs.forEach(async (ID) => {
+            // Retrieve Contol ID from WAQuestionTable table
+            const id = ID.ControlID.S;
+            const input = {
+                TableName : 'WAQuestionTable',
+                ExpressionAttributeValues: {
+                    ':id': { S: id}
+                },
+                KeyConditionExpression: 'id = :id',
+                // Need only ControlID to answer the particular best practice in question
+                ProjectionExpression: 'QuestionId,ChoiceId',
+            };
+            //console.log(input);
+            // Get QuestionId and ChoiceID to update answer in your workload
+            const command = new QueryCommand(input);
+            const result = await DBclient.send(command);
+
+            //console.log('ChoiceID: ', result.Items[0].ChoiceId.S);
+            //console.log('QuestionId: ', result.Items[0].QuestionId.S);
+
+            const ChoiceId = result.Items[0].ChoiceId.S;
+            const QuestionId = result.Items[0].QuestionId.S;
+
+            //Update answer in your workload
+            const params = {
+                LensAlias: 'wellarchitected',
+                QuestionId: QuestionId,
+                WorkloadId: 'XXXXXXXXXXXXXXX',
+                ChoiceUpdates: {
+                    [ChoiceId] : {
+                        Status: 'SELECTED'
+                    }
+                },
             }
-            //else {
-            //    console.log('not compliant or insufficient data');
-            //}
+            
+            //console.log(params);
+            // adding artificial delay for 600ms to avoid write conflicts
+
+            //const WAcommand = new UpdateAnswerCommand(params);
+            //const response = await WAclient.send(WAcommand);
+            //console.log(QuestionId, response);
+            //delay between each call to UpdateAnswer
+            const response = sleep(UpdateWA, WAclient, params, iteration);
+            iteration += 1;
         })
+
+
+        //test param to test out the artifical delay
+        /*
+        const params = {
+            LensAlias: 'wellarchitected',
+            QuestionId: 'permissions',
+            WorkloadId: 'b42cbfef6ff80e452190ddc4e690bbe4',
+            ChoiceUpdates: { 'sec_permissions_emergency_process' : { Status: 'SELECTED' } }
+        }
+
+        const response = sleep(UpdateWA, WAclient, params, iteration)
+        */
         return true;
-    } catch (err){
+
+    } catch(err){
         console.error(err);
         return false;
     }
 }
+
+// wait 2s before calling UpdateWA(WAclient, params)
+// Sleep in an exponential manner.
+function sleep (UpdateWA, WAclient, params, iteration) {
+    //console.log(iteration);
+    return new Promise((resolve) => {
+        setTimeout(() => resolve(UpdateWA(WAclient, params)), (iteration+1) * 1000);
+    })
+}
+
+// update answer in WA
+async function UpdateWA(WAclient, params){
+        const WAcommand = new UpdateAnswerCommand(params);
+        const response = await WAclient.send(WAcommand);
+        return response;
+        //return true;
+}
+
+module.exports.UpdateAnswer = UpdateAnswer;
